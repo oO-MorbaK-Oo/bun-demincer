@@ -25,6 +25,7 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { DEFAULT_EXPORT_HELPER, detectExportHelper, extractExportPairs } from "./bun-runtime.mjs";
 import { join, dirname } from "path";
 
 // ─── Reassembly mode ────────────────────────────────────────────────────────
@@ -247,37 +248,18 @@ const GENERIC_NAMES = new Set([
   "config",
 ]);
 
+// The __export helper name changes with every build: detect it by structure
+const exportHelper = detectExportHelper(code.slice(0, 200_000)) || DEFAULT_EXPORT_HELPER;
+console.log(`Export helper: ${exportHelper}()${exportHelper === DEFAULT_EXPORT_HELPER ? " (default, not detected)" : ""}`);
+
 /**
- * Extract MR() export mappings from content.
+ * Extract __export() mappings from content.
  * Returns { exports: { exportName: localVar }, primaryName: string|null }
  */
 function extractModuleExports(content) {
   const exports = {};
-  const mrCallRe = /MR\([^,]+,\s*\{/g;
-  let match;
-
-  while ((match = mrCallRe.exec(content)) !== null) {
-    const startIdx = match.index + match[0].length;
-    let depth = 1;
-    let endIdx = startIdx;
-
-    while (endIdx < content.length && depth > 0) {
-      const ch = content[endIdx];
-      if (ch === "{") depth++;
-      else if (ch === "}") depth--;
-      endIdx++;
-    }
-
-    if (depth !== 0) continue;
-
-    const body = content.substring(startIdx, endIdx - 1);
-    const pairRe =
-      /([A-Za-z_$][A-Za-z0-9_$]*):\s*\(\)\s*=>\s*([A-Za-z_$][A-Za-z0-9_$]*)/g;
-    let pairMatch;
-
-    while ((pairMatch = pairRe.exec(body)) !== null) {
-      exports[pairMatch[1]] = pairMatch[2];
-    }
+  for (const { exportName, minifiedVar } of extractExportPairs(content, exportHelper)) {
+    exports[exportName] = minifiedVar;
   }
 
   // Select primary name: longest non-generic CamelCase/snake_case name
@@ -467,6 +449,9 @@ const manifest = {
     source: srcPath,
     sourceSize: src.length,
     wrapperOffset,
+    moduleFactory: modFn,
+    lazyInitializer: lazFn,
+    exportHelper,
     generatedAt: new Date().toISOString(),
     tool: "resplit.mjs",
   },

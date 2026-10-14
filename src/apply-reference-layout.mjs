@@ -25,6 +25,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { assertInside, resolveInside } from "./path-guard.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -176,7 +177,8 @@ console.log();
 // but move them to vendor/<pkg>/ directory.
 const refFileCounts = {};
 for (const meta of Object.values(refModules)) {
-  refFileCounts[meta.file] = (refFileCounts[meta.file] || 0) + 1;
+  const file = String(meta.file).replace(/\\/g, "/");
+  refFileCounts[file] = (refFileCounts[file] || 0) + 1;
 }
 const concatenatedFiles = new Set(
   Object.entries(refFileCounts)
@@ -200,8 +202,9 @@ for (const [modId, targetMeta] of Object.entries(targetManifest.modules)) {
     continue;
   }
 
-  const targetFile = targetMeta.file;
-  let refFile = refMeta.file;
+  // Manifest paths always use "/" (older Windows runs may have stored "\")
+  const targetFile = String(targetMeta.file).replace(/\\/g, "/");
+  let refFile = String(refMeta.file).replace(/\\/g, "/");
 
   // Handle concatenated vendor files: ref says "vendor/aws-sdk.js" (old format)
   // but we want to keep individual files. Use "vendor/<pkg>/<NNNN>.js" instead.
@@ -223,9 +226,9 @@ for (const [modId, targetMeta] of Object.entries(targetManifest.modules)) {
   // from resplit, only change the directory to match the reference layout.
   // This prevents vendor files from being renamed to descriptive names.
   else if (refMeta.vendor) {
-    const targetBasename = path.basename(targetFile);   // e.g. "1198.js"
-    const refDirPart = path.dirname(refFile);           // e.g. "vendor/lodash"
-    refFile = path.join(refDirPart, targetBasename);    // "vendor/lodash/1198.js"
+    const targetBasename = path.posix.basename(targetFile);  // e.g. "1198.js"
+    const refDirPart = path.posix.dirname(refFile);          // e.g. "vendor/lodash"
+    refFile = path.posix.join(refDirPart, targetBasename);   // "vendor/lodash/1198.js"
   }
 
   if (targetFile === refFile) {
@@ -245,6 +248,19 @@ for (const [modId, targetMeta] of Object.entries(targetManifest.modules)) {
 
 for (const modId of Object.keys(refModules)) {
   if (!targetManifest.modules[modId]) noTarget.push(modId);
+}
+
+// Reference layouts may come from elsewhere: drop any move whose source or
+// destination would land outside the target directory, before touching files.
+const unsafeMoves = moves.filter(
+  (m) => !resolveInside(targetDir, m.from) || !resolveInside(targetDir, m.to),
+);
+if (unsafeMoves.length > 0) {
+  for (const m of unsafeMoves) {
+    console.warn(`Warning: skipping unsafe move for ${m.modId}: ${m.from} → ${m.to}`);
+  }
+  const unsafeSet = new Set(unsafeMoves);
+  moves.splice(0, moves.length, ...moves.filter((m) => !unsafeSet.has(m)));
 }
 
 console.log(`Already correct: ${alreadyCorrect}`);
@@ -276,8 +292,8 @@ const createdDirs = new Set();
 const fileOrderMap = new Map(); // old path → new path
 
 for (const m of moves) {
-  const srcPath = path.join(targetDir, m.from);
-  const dstPath = path.join(targetDir, m.to);
+  const srcPath = assertInside(targetDir, m.from, "source module");
+  const dstPath = assertInside(targetDir, m.to, "destination module");
 
   if (!fs.existsSync(srcPath)) {
     skipped++;
@@ -297,7 +313,7 @@ for (const m of moves) {
     const ext = path.extname(m.to);
     const base = m.to.slice(0, -ext.length);
     const newTo = `${base}-${m.modId}${ext}`;
-    const newDstPath = path.join(targetDir, newTo);
+    const newDstPath = assertInside(targetDir, newTo, "destination module");
     fs.renameSync(srcPath, newDstPath);
     m.to = newTo;
   } else {

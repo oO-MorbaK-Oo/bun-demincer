@@ -349,11 +349,21 @@ function splitSmartRenames(flatRenames, moduleNames) {
   return { interfaceRenames, localRenames };
 }
 
+// Rename targets are printed verbatim by recast/babel, so anything that is not a
+// plain identifier would be injected as raw code into the output files.
+const IDENTIFIER_RE = /^[\p{ID_Start}$_][\p{ID_Continue}$‌‍]*$/u;
+
+function isValidIdentifierName(name) {
+  return typeof name === "string" && IDENTIFIER_RE.test(name);
+}
+
 function filterReservedAndBuiltins(renames) {
   const skipped = [];
   const filtered = {};
   for (const [oldName, newName] of Object.entries(renames)) {
     const blocked =
+      !isValidIdentifierName(newName) ||
+      !isValidIdentifierName(oldName) ||
       RESERVED_WORDS.has(newName) ||
       GLOBAL_BUILTINS.has(newName) ||
       RESERVED_WORDS.has(oldName) ||
@@ -1223,7 +1233,7 @@ function main() {
 
   if (skippedReserved.length > 0) {
     console.warn(
-      `Skipped ${skippedReserved.length} rename(s) to/from reserved or global builtin names`
+      `Skipped ${skippedReserved.length} rename(s) to/from invalid, reserved or global builtin names`
     );
   }
 

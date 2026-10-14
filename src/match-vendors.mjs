@@ -20,6 +20,11 @@ import fs from "fs";
 import path from "path";
 import { parse } from "@babel/parser";
 import _traverse from "@babel/traverse";
+import { fileURLToPath } from "url";
+import { resolveInside } from "./path-guard.mjs";
+import { resourceRoot } from "./subcommand.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const traverse = _traverse.default || _traverse;
 
@@ -50,7 +55,8 @@ Identify escaped vendor modules by fingerprint matching against npm packages.
 
 Options:
   --npm-dir <path>         node_modules directory with reference packages (required for matching)
-  --db <path>              Load/save fingerprint DB (default: vendor-fingerprints.json)
+  --db <path>              Load/save fingerprint DB (default: vendor-fingerprints.json,
+                           else the shipped data/vendor-fingerprints-1000.json)
   --rebuild-db             Force rebuild fingerprint DB even if file exists
   --out <path>             Output vendor overrides JSON (default: vendor-overrides.json)
   --threshold <n>          Min containment score to flag as vendor (default: 0.5)
@@ -92,6 +98,7 @@ function parseArgs() {
         break;
       case "--db":
         opts.db = args[++i];
+        opts.dbExplicit = true;
         i++;
         break;
       case "--rebuild-db":
@@ -156,6 +163,11 @@ function parseArgs() {
     console.error("Error: <resplit-dir> is required");
     printUsage();
     process.exit(1);
+  }
+  // Without --db, fall back to the shipped DB (repo data/ or next to the executable)
+  if (!opts.dbExplicit && !opts.rebuildDb && !fs.existsSync(opts.db)) {
+    const shipped = path.join(resourceRoot(__dirname), "data", "vendor-fingerprints-1000.json");
+    if (fs.existsSync(shipped)) opts.db = shipped;
   }
   const needsNpmDir = !opts.floodFillOnly && (!fs.existsSync(opts.db) || opts.rebuildDb);
   if (!opts.npmDir && needsNpmDir) {
@@ -405,7 +417,8 @@ function scanPackage(pkgDir, pkgName) {
     // Skip very small files (< 50 bytes)
     if (code.length < 50) continue;
 
-    const relPath = path.relative(pkgDir, filePath);
+    // Stored in the shared fingerprint DB: keep "/" separators on every platform
+    const relPath = path.relative(pkgDir, filePath).split(path.sep).join("/");
     const fp = extractFingerprint(code, filePath);
 
     // Only include files with meaningful fingerprints
@@ -865,7 +878,13 @@ function classifyAndMove(manifest, manifestPath, resplitDir, noMove, dryRun) {
   // Group by package for organized output
   const byPkg = new Map();
   for (const [name, mod] of vendorModules) {
-    const pkg = mod.vendorPackage || "_unidentified";
+    let pkg = mod.vendorPackage || "_unidentified";
+    // Package names end up as directory names: keep them inside vendor/
+    if (!resolveInside(vendorDir, pkg)) {
+      console.warn(`  Warning: unsafe vendor package name ${JSON.stringify(pkg)}, using _unidentified`);
+      pkg = "_unidentified";
+      mod.vendorPackage = pkg;
+    }
     if (!byPkg.has(pkg)) byPkg.set(pkg, []);
     byPkg.get(pkg).push([name, mod]);
   }
@@ -879,7 +898,11 @@ function classifyAndMove(manifest, manifestPath, resplitDir, noMove, dryRun) {
     pkgIdxMap.set(pkg, 1);
 
     for (const [name, mod] of mods) {
-      const oldPath = path.join(resplitDir, mod.file);
+      const oldPath = resolveInside(resplitDir, mod.file);
+      if (!oldPath) {
+        console.warn(`  Warning: skipping module ${name} with unsafe path ${JSON.stringify(mod.file)}`);
+        continue;
+      }
       const vidx = pkgIdxMap.get(pkg);
       const idxStr = String(vidx).padStart(4, "0");
       // Keep primaryName suffix if present

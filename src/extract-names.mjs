@@ -25,6 +25,8 @@ import path from "path";
 
 const DEFAULT_INPUT_DIR = null; // require explicit path
 
+const IDENTIFIER_RE = /^[\p{ID_Start}$_][\p{ID_Continue}$‌‍]*$/u;
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
@@ -227,6 +229,7 @@ function main() {
     classAssign: 0,
     displayName: 0,
     skippedHashName: 0,
+    skippedInvalidName: 0,
     skippedShortVar: 0,
     skippedExisting: 0,
     skippedConflicts: 0,
@@ -254,6 +257,13 @@ function main() {
       // Skip names starting with # (DOM node names like #document, #text)
       if (entry.readableName.startsWith("#")) {
         stats.skippedHashName++;
+        continue;
+      }
+
+      // Skip names that are not plain identifiers: the string comes from the
+      // analyzed bundle and would otherwise be emitted as raw code by rename.mjs
+      if (!IDENTIFIER_RE.test(entry.readableName)) {
+        stats.skippedInvalidName++;
         continue;
       }
 
@@ -340,6 +350,7 @@ function main() {
     console.error(`  class X extends { this.name } ${stats.classDecl} (decl) + ${stats.classAssign} (assign)`);
     console.error(`  X.displayName = "..."         ${stats.displayName}`);
     console.error(`  Skipped (# prefix):           ${stats.skippedHashName}`);
+    console.error(`  Skipped (invalid identifier): ${stats.skippedInvalidName}`);
     console.error(`  Skipped (short var):          ${stats.skippedShortVar}`);
     console.error(`  Skipped (same name):          ${stats.skippedSameName}`);
     console.error(`  Skipped (in existing):        ${stats.skippedExisting}`);

@@ -25,6 +25,8 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+import { assertInside, resolveInside } from "./path-guard.mjs";
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -81,13 +83,21 @@ function loadJSON(filepath) {
   return JSON.parse(fs.readFileSync(filepath, "utf8"));
 }
 
-const projectRoot = path.dirname(import.meta.url.replace("file://", ""));
+// fileURLToPath handles Windows drive letters (file:///D:/...) correctly
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+
+// Graph/cluster inputs are looked up in the current directory first (where
+// extract-deps / cluster-graph write them), then next to this script.
+function inputPath(name) {
+  const fromCwd = path.resolve(name);
+  return fs.existsSync(fromCwd) ? fromCwd : path.join(scriptDir, name);
+}
 
 console.log("Loading inputs...");
 const manifest = loadJSON(path.join(resplitDir, "manifest.json"));
-const clustersData = loadJSON(path.join(projectRoot, "clusters-core.json"));
-const labelsData = loadJSON(path.join(projectRoot, "cluster-labels.json"));
-const depsGraph = loadJSON(path.join(projectRoot, "deps-graph.json"));
+const clustersData = loadJSON(inputPath("clusters-core.json"));
+const labelsData = loadJSON(inputPath("cluster-labels.json"));
+const depsGraph = loadJSON(inputPath("deps-graph.json"));
 
 // ─── Phase 1: Assign every module to a directory ──────────────────────────────
 
@@ -289,8 +299,26 @@ if (dryRun) {
 
 console.log(`\nCopying to ${outDir}...`);
 
-// Clean output dir if exists
+// Clean output dir if exists — only when it is a previous organize.mjs output
+// (or empty), and never when it contains the input or the filesystem root.
 if (fs.existsSync(outDir)) {
+  if (
+    outDir === path.parse(outDir).root ||
+    outDir === resplitDir ||
+    resolveInside(outDir, resplitDir)
+  ) {
+    console.error(`Error: refusing to delete ${outDir} (contains the input directory or is a root)`);
+    process.exit(1);
+  }
+  let previousOutput = fs.readdirSync(outDir).length === 0;
+  try {
+    const prev = loadJSON(path.join(outDir, "manifest.json"));
+    previousOutput ||= prev?._meta?.organizeTool === "organize.mjs";
+  } catch {}
+  if (!previousOutput) {
+    console.error(`Error: ${outDir} exists and is not a previous organize.mjs output; remove it manually`);
+    process.exit(1);
+  }
   fs.rmSync(outDir, { recursive: true });
 }
 fs.mkdirSync(outDir, { recursive: true });
@@ -298,13 +326,13 @@ fs.mkdirSync(outDir, { recursive: true });
 // Copy organized app modules
 const createdDirs = new Set();
 for (const [file, info] of assignments) {
-  const destDir = path.join(outDir, info.dir);
+  const destDir = assertInside(outDir, info.dir, "cluster directory");
   if (!createdDirs.has(destDir)) {
     fs.mkdirSync(destDir, { recursive: true });
     createdDirs.add(destDir);
   }
-  const src = path.join(resplitDir, file);
-  const dest = path.join(destDir, file);
+  const src = assertInside(resplitDir, file, "source module");
+  const dest = assertInside(destDir, file, "destination module");
   if (fs.existsSync(src)) {
     fs.copyFileSync(src, dest);
   }

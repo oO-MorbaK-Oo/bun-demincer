@@ -17,6 +17,7 @@
 
 import fs from "fs";
 import path from "path";
+import { DEFAULT_EXPORT_HELPER, detectExportHelper, extractExportPairs } from "./bun-runtime.mjs";
 
 const DEFAULT_INPUT_DIR = null; // require explicit path
 const DEFAULT_GENERIC_NAMES = new Set([
@@ -40,6 +41,7 @@ function parseArgs() {
     stats: false,
     skipGeneric: true,
     minNameLength: 3,
+    exportFn: null,
   };
 
   let i = 0;
@@ -62,6 +64,9 @@ function parseArgs() {
         console.error("Error: --min-name-length must be a non-negative integer");
         process.exit(1);
       }
+      i++;
+    } else if (args[i] === "--export-fn") {
+      opts.exportFn = args[++i];
       i++;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printUsage();
@@ -87,8 +92,9 @@ function parseArgs() {
 function printUsage() {
   console.log(`Usage: node extract-exports.mjs [inputDir] [options]
 
-Scans split bundle files for MR(target, { exportName: () => minifiedVar })
-patterns and outputs a JSON rename map { "minifiedVar": "exportName" }.
+Scans split bundle files for __export(target, { exportName: () => minifiedVar })
+calls (helper name auto-detected, historically "MR") and outputs a JSON rename
+map { "minifiedVar": "exportName" }.
 
 Arguments:
   inputDir                   Directory containing .js files to scan (required)
@@ -99,52 +105,27 @@ Options:
   --skip-generic             Skip generic names like "call", "default" (default)
   --no-skip-generic          Include generic names
   --min-name-length N        Minimum export name length to include (default: 3)
+  --export-fn NAME           __export helper name (default: auto-detected, "MR" as last resort)
   -h, --help                 Show this help message`);
 }
 
 /**
- * Extract all MR() export mappings from a single file's content.
- * Returns an array of { exportName, minifiedVar } objects.
+ * Resolve the __export helper name for a split directory:
+ * --export-fn, then resplit manifest metadata, then structural detection in
+ * 00-runtime.js / the files themselves, then the historical "MR".
  */
-function extractMRExports(content) {
-  const results = [];
-
-  // Match MR(target, { ... }) — the body can be very long (100K+ chars on one line),
-  // so we use a non-greedy approach: find "MR(" then skip the first arg and comma,
-  // then match the opening "{" and find the matching "}".
-  const mrCallRe = /MR\([^,]+,\s*\{/g;
-  let match;
-
-  while ((match = mrCallRe.exec(content)) !== null) {
-    // Find the matching closing brace, handling nested braces
-    const startIdx = match.index + match[0].length;
-    let depth = 1;
-    let endIdx = startIdx;
-
-    while (endIdx < content.length && depth > 0) {
-      const ch = content[endIdx];
-      if (ch === "{") depth++;
-      else if (ch === "}") depth--;
-      endIdx++;
-    }
-
-    if (depth !== 0) continue; // unmatched brace, skip
-
-    const body = content.substring(startIdx, endIdx - 1);
-
-    // Extract exportName: () => minifiedVar pairs from the body
-    const pairRe = /([A-Za-z_$][A-Za-z0-9_$]*):\s*\(\)\s*=>\s*([A-Za-z_$][A-Za-z0-9_$]*)/g;
-    let pairMatch;
-
-    while ((pairMatch = pairRe.exec(body)) !== null) {
-      results.push({
-        exportName: pairMatch[1],
-        minifiedVar: pairMatch[2],
-      });
-    }
+function resolveExportHelper(opts, files) {
+  if (opts.exportFn) return { name: opts.exportFn, source: "--export-fn" };
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(opts.inputDir, "manifest.json"), "utf-8"));
+    if (manifest?._meta?.exportHelper) return { name: manifest._meta.exportHelper, source: "manifest" };
+  } catch {}
+  const ordered = files.includes("00-runtime.js") ? ["00-runtime.js", ...files] : files;
+  for (const file of ordered) {
+    const name = detectExportHelper(fs.readFileSync(path.join(opts.inputDir, file), "utf-8"));
+    if (name) return { name, source: `detected in ${file}` };
   }
-
-  return results;
+  return { name: DEFAULT_EXPORT_HELPER, source: "default" };
 }
 
 function main() {
@@ -172,6 +153,8 @@ function main() {
     process.exit(1);
   }
 
+  const exportHelper = resolveExportHelper(opts, files);
+
   // Stats counters
   let totalPairs = 0;
   let skippedGeneric = 0;
@@ -188,7 +171,7 @@ function main() {
   for (const file of files) {
     const filePath = path.join(opts.inputDir, file);
     const content = fs.readFileSync(filePath, "utf-8");
-    const pairs = extractMRExports(content);
+    const pairs = extractExportPairs(content, exportHelper.name);
 
     for (const { exportName, minifiedVar } of pairs) {
       totalPairs++;
@@ -259,7 +242,8 @@ function main() {
     const included = Object.keys(renameMap).length;
     console.error("--- Export Extraction Stats ---");
     console.error(`  Files scanned:           ${files.length}`);
-    console.error(`  Total MR() pairs found:  ${totalPairs}`);
+    console.error(`  Export helper:           ${exportHelper.name}() (${exportHelper.source})`);
+    console.error(`  Total export pairs:      ${totalPairs}`);
     console.error(`  Skipped (same name):     ${skippedSameName}`);
     console.error(`  Skipped (generic):       ${skippedGeneric}`);
     console.error(`  Skipped (short name):    ${skippedShort}`);

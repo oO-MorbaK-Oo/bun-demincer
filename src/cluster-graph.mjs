@@ -13,7 +13,19 @@ import { join, basename } from "path";
 import Graph from "graphology";
 import louvain from "graphology-communities-louvain";
 import forceAtlas2 from "graphology-layout-forceatlas2";
-import { createCanvas } from "canvas";
+
+// canvas is a native addon: loaded only for --png, and left out of the
+// single-executable build (its DLLs cannot be embedded).
+let createCanvas = null;
+async function loadCanvas() {
+  try {
+    return (await import("canvas")).createCanvas;
+  } catch (err) {
+    console.error(`--png needs the "canvas" package (${err.message}).`);
+    console.error("Run from source (node src/cluster-graph.mjs) with npm dependencies installed, or omit --png.");
+    process.exit(1);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -666,8 +678,9 @@ function buildClusterLabels(graph, communities, depsGraph) {
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
   const opts = parseArgs();
+  if (opts.png) createCanvas = await loadCanvas();
 
   // Load deps graph
   if (!existsSync(opts.graphPath)) {

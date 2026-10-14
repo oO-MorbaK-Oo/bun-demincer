@@ -23,3 +23,6 @@ clusters*.png
 
 # Reassembled bundles
 reassembled.js
+
+# Single-executable build output (npm run build:exe)
+dist/

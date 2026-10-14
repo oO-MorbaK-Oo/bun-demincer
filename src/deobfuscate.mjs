@@ -26,16 +26,20 @@ import fs from "fs";
 import path from "path";
 import vm from "vm";
 import { fileURLToPath } from "url";
-import { execSync, spawnSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 import { createRequire } from "module";
+import { scriptCommand } from "./subcommand.mjs";
 
-const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // @wakaru/unminify ESM dist has a broken prettier import (no .js extension),
-// so we use CJS require which resolves fine.
-const { runTransformationRules } = require("@wakaru/unminify");
+// so we use the CJS build. Bun provides `require` in ESM and its bundler embeds
+// these literal require() calls (needed for `bun build --compile`); Node goes
+// through createRequire.
+const cjsRequire = typeof require === "function" ? require : createRequire(import.meta.url);
+const { runTransformationRules } =
+  typeof require === "function" ? require("@wakaru/unminify") : cjsRequire("@wakaru/unminify");
 
 // ── Argument parsing ──────────────────────────────────────────────
 
@@ -289,7 +293,7 @@ async function stageWakaru(dir, files, concurrency, strictWakaru = false, wakaru
 function stageLebab(dir, files) {
   console.log("\n━━━ Stage 2: lebab (ES5→ES6+) ━━━");
 
-  const lebab = require("lebab");
+  const lebab = typeof require === "function" ? require("lebab") : cjsRequire("lebab");
   // Safe transforms only — these won't break code
   const transforms = [
     "arrow",
@@ -329,16 +333,16 @@ function stageLebab(dir, files) {
 // ── Stage 3: extract-exports (auto-rename map) ──────────────────
 
 function stageExtract(dir) {
-  console.log("\n━━━ Stage 3: extract (auto-rename from MR() exports) ━━━");
+  console.log("\n━━━ Stage 3: extract (auto-rename from __export() mappings) ━━━");
 
-  const extractMjs = path.join(__dirname, "extract-exports.mjs");
+  const [cmd, cmdArgs] = scriptCommand(__dirname, "extract-exports");
   const outFile = path.join(dir, ".auto-renames.json");
 
   try {
-    const result = execSync(
-      `node "${extractMjs}" "${dir}" --out "${outFile}" --stats`,
+    execFileSync(
+      cmd,
+      [...cmdArgs, dir, "--out", outFile, "--stats"],
       {
-        cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
         timeout: 60000,
       }
@@ -352,7 +356,7 @@ function stageExtract(dir) {
 
     const data = JSON.parse(fs.readFileSync(outFile, "utf-8"));
     const count = Object.keys(data).length;
-    console.log(`  Extracted ${count} auto-renames from MR() export mappings`);
+    console.log(`  Extracted ${count} auto-renames from __export() mappings`);
 
     return outFile;
   } catch (err) {
@@ -373,21 +377,18 @@ function stageExtract(dir) {
 function stageExtractNames(dir, existingBatchFiles) {
   console.log("\n━━━ Stage 3b: extract-names (this.name/displayName patterns) ━━━");
 
-  const extractNamesMjs = path.join(__dirname, "extract-names.mjs");
+  const [cmd, cmdArgs] = scriptCommand(__dirname, "extract-names");
   const outFile = path.join(dir, ".auto-names.json");
 
   // Build --exclude-existing args from all batch files collected so far
-  const excludeArgs = existingBatchFiles
-    .filter((f) => fs.existsSync(f))
-    .map((f) => `"${f}"`)
-    .join(" ");
-  const excludeFlag = excludeArgs ? `--exclude-existing ${excludeArgs}` : "";
+  const excludeFiles = existingBatchFiles.filter((f) => fs.existsSync(f));
+  const excludeArgs = excludeFiles.length > 0 ? ["--exclude-existing", ...excludeFiles] : [];
 
   try {
-    execSync(
-      `node "${extractNamesMjs}" "${dir}" --out "${outFile}" --stats ${excludeFlag}`,
+    execFileSync(
+      cmd,
+      [...cmdArgs, dir, "--out", outFile, "--stats", ...excludeArgs],
       {
-        cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
         timeout: 60000,
       }
@@ -461,7 +462,7 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
     return;
   }
 
-  const renameMjs = path.join(__dirname, "rename.mjs");
+  const [renameCmd, renameCmdArgs] = scriptCommand(__dirname, "rename");
 
   // Merge all batch files into a single rename map
   const merged = {};
@@ -512,7 +513,7 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
   fs.writeFileSync(tmpBatch, JSON.stringify(merged, null, 2));
 
   const renameArgs = [
-    renameMjs,
+    ...renameCmdArgs,
     "--batch",
     tmpBatch,
     "--dir",
@@ -524,8 +525,7 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
   renameArgs.push("--smart");
   try {
     // Stream output live so long rename passes don't look "stuck".
-    const result = spawnSync("node", renameArgs, {
-      cwd: __dirname,
+    const result = spawnSync(renameCmd, renameArgs, {
       stdio: "inherit",
       timeout: 600000,
     });

@@ -43,10 +43,14 @@ function findLargestBundle(dir) {
   return best;
 }
 import path from "path";
-import { execFileSync, execSync } from "child_process";
+import { execFileSync } from "child_process";
 import os from "os";
+import { fileURLToPath } from "url";
+import { detectExportHelper } from "./bun-runtime.mjs";
+import { scriptCommand } from "./subcommand.mjs";
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
+// fileURLToPath handles Windows drive letters (URL.pathname gives "/D:/...")
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VERSIONS_DIR = path.join(__dirname, "versions");
 
 // ─── Common properties to exclude (too ubiquitous for fingerprinting) ────────
@@ -133,7 +137,9 @@ function resolveVersionDir(name) {
   const ver = name.replace(/^v/, "");
 
   // Search versions dir for matching folder
-  const dirs = fs.readdirSync(VERSIONS_DIR).filter(d => d.includes("_v")).sort();
+  const dirs = fs.existsSync(VERSIONS_DIR)
+    ? fs.readdirSync(VERSIONS_DIR).filter(d => d.includes("_v")).sort()
+    : [];
   const match = dirs.find(d => d.includes(`_v${ver}`));
   if (match) return path.join(VERSIONS_DIR, match);
 
@@ -171,8 +177,8 @@ function ensureResplit(versionDir) {
   }
 
   console.error(`Resplitting ${path.basename(versionDir)}...`);
-  const resplitScript = path.join(__dirname, "resplit.mjs");
-  execSync(`node ${resplitScript} "${bundlePath}" "${resplitDir}"`, {
+  const [cmd, cmdArgs] = scriptCommand(__dirname, "resplit");
+  execFileSync(cmd, [...cmdArgs, bundlePath, resplitDir], {
     stdio: ["pipe", "pipe", "inherit"],
   });
   console.error(`  Done.`);
@@ -509,11 +515,19 @@ function detectPreamble(resplitDir) {
     if (m) preamble.esmLazy = m[1];
   }
 
-  // Export register: gR = (T, R) => { for (var A in R) ...configurable
+  // Export register (__export): detected by structure, parameter names vary per build
   {
-    const m = src.match(new RegExp(decl + `([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*=\\s*\\(T,\\s*R\\)\\s*=>\\s*\\{\\s*for\\s*\\(var\\s+A\\s+in\\s+R\\)[^}]*configurable`));
-    if (m) preamble.exportReg = m[1];
+    const name = detectExportHelper(fs.readFileSync(runtimePath, "utf8"));
+    if (name) preamble.exportReg = name;
   }
+
+  // Helper names recorded by resplit.mjs take precedence (detected on the full bundle)
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(resplitDir, "manifest.json"), "utf8"))._meta || {};
+    if (meta.moduleFactory) preamble.cjsFactory = meta.moduleFactory;
+    if (meta.lazyInitializer) preamble.esmLazy = meta.lazyInitializer;
+    if (meta.exportHelper) preamble.exportReg = meta.exportHelper;
+  } catch {}
 
   // Interop (3 params): x = (T, R, A) => { var _ = T!=null ...
   // Distinguished from reExport by first statement: `var _ = T != null`
@@ -718,8 +732,46 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const DIFF_MAX_BUFFER = 256 * 1024 * 1024;
+let diffTool = null; // "diff" | "git", detected on first use
+
 /**
- * Diff two normalized sources using the system diff command.
+ * Run a unified diff with the same contract as `diff -u`: returns on exit 0,
+ * throws with status 1 (and e.diffText) on differences, other status on error.
+ * Falls back to `git diff --no-index` where `diff` is unavailable (Windows).
+ */
+function runUnifiedDiff(fileA, fileB, labelA, labelB) {
+  if (diffTool !== "git") {
+    try {
+      execFileSync("diff", ["-u", "--label", labelA, "--label", labelB, fileA, fileB], { maxBuffer: DIFF_MAX_BUFFER });
+      diffTool = "diff";
+      return;
+    } catch (e) {
+      if (e.code !== "ENOENT") {
+        diffTool = "diff";
+        throw e;
+      }
+      diffTool = "git";
+    }
+  }
+  try {
+    execFileSync("git", ["diff", "--no-index", "--no-color", "--no-ext-diff", "-U3", fileA, fileB], {
+      maxBuffer: DIFF_MAX_BUFFER,
+    });
+  } catch (e) {
+    if (e.status === 1) {
+      // Replace git's "diff --git / index / --- a/... / +++ b/..." preamble with diff -u style labels
+      const lines = (e.stdout?.toString("utf8") || "").split("\n");
+      const hunkStart = lines.findIndex((l) => l.startsWith("@@"));
+      const body = hunkStart >= 0 ? lines.slice(hunkStart) : [];
+      e.diffText = [`--- ${labelA}`, `+++ ${labelB}`, ...body].join("\n");
+    }
+    throw e;
+  }
+}
+
+/**
+ * Diff two normalized sources using the system diff command (or git as fallback).
  * Returns { diffText, diffLines, changed }
  */
 function diffSources(normalizedA, normalizedB, labelA, labelB) {
@@ -732,13 +784,13 @@ function diffSources(normalizedA, normalizedB, labelA, labelB) {
     fs.writeFileSync(fileB, normalizedB);
 
     try {
-      execFileSync("diff", ["-u", "--label", labelA, "--label", labelB, fileA, fileB]);
+      runUnifiedDiff(fileA, fileB, labelA, labelB);
       // Exit 0 = identical
       return { diffText: "", diffLines: 0, changed: false };
     } catch (e) {
       if (e.status === 1) {
         // Exit 1 = differences found
-        const diffText = e.stdout?.toString("utf8") || "";
+        const diffText = e.diffText ?? (e.stdout?.toString("utf8") || "");
         const diffLines = diffText.split("\n").filter(l => l.startsWith("+") || l.startsWith("-"))
           .filter(l => !l.startsWith("+++") && !l.startsWith("---")).length;
         return { diffText, diffLines, changed: true };

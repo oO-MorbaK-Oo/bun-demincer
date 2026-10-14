@@ -29,11 +29,13 @@ npm install
 ### Full pipeline (cold-start — no prior knowledge of the binary)
 
 ```bash
-# 1. Extract JS from a Bun binary
+# 1. Extract JS from a Bun binary (macOS, Linux or Windows .exe)
 node src/extract.mjs /path/to/bun-binary extracted/
+#    → prints the entry bundle path (also "entryFile" in extracted/manifest.json)
+#    → extracted/_sources/ if the binary embeds sourcemaps (original pre-bundle sources)
 
-# 2. Split into individual modules
-node src/resplit.mjs extracted/bundle.js resplit/
+# 2. Split into individual modules (use the entry bundle printed by step 1)
+node src/resplit.mjs extracted/<entry>.js resplit/
 
 # 3. Classify vendor packages via fingerprint DB
 node src/match-vendors.mjs resplit/ --db data/vendor-fingerprints-1000.json --classify
@@ -43,11 +45,11 @@ cp -r resplit/ decoded/
 node src/deobfuscate.mjs --dir decoded/
 
 # 5. Build dependency graph
-node src/extract-deps.mjs decoded/manifest.json --out deps-graph.json
+node src/extract-deps.mjs decoded/ --out deps-graph.json
 
 # 6. Cluster modules (sweep resolutions, pick the best one)
 node src/cluster-graph.mjs deps-graph.json --sweep
-node src/cluster-graph.mjs deps-graph.json --pick 1.5 --png
+node src/cluster-graph.mjs deps-graph.json --pick 1.5 --png --out clusters-core
 #    → clusters-core.json (cluster membership)
 #    → clusters.png (visualization)
 
@@ -56,9 +58,13 @@ node src/cluster-graph.mjs deps-graph.json --pick 1.5 --png
 #    See "Organizing modules" below for the format.
 
 # 8. Organize into semantic directories
+#    (reads deps-graph.json, clusters-core.json, cluster-labels.json from the current directory)
 node src/organize.mjs decoded/
 #    → decoded-organized/ with named directories + INDEX.md
+#    An existing --out directory is only replaced if it is a previous organize.mjs output.
 ```
+
+On Windows (PowerShell), replace `cp -r resplit/ decoded/` with `Copy-Item resplit decoded -Recurse`.
 
 Steps 1-4 are fully automated. Steps 5-8 organize the output into directories — step 7 requires manual labeling (or an LLM).
 
@@ -102,9 +108,30 @@ node src/transfer-artifacts.mjs new-version/ --reference old-version/
 node src/apply-reference-layout.mjs new-decoded/ --reference old-decoded-organized/
 ```
 
+### Single executable (no Node.js / npm needed on the target machine)
+
+```bash
+npm install
+npm run build:exe            # requires Bun → dist/bun-demincer(.exe)
+
+bun-demincer extract app.exe extracted
+bun-demincer resplit extracted/app.js resplit
+bun-demincer match-vendors resplit --classify
+bun-demincer deobfuscate --dir decoded
+```
+
+Every script is available as a subcommand (`bun-demincer --help`). From source, the same
+dispatcher is `node src/cli.mjs <command>` (or `bun src/cli.mjs`). Notes:
+- Put `data/vendor-fingerprints-1000.json` in a `data/` folder next to the executable to use it
+  as the default `--db` for `match-vendors`.
+- `cluster-graph --png` needs the native `canvas` addon, which cannot be embedded: run
+  `node src/cluster-graph.mjs ... --png` from source for the PNG.
+- The executable targets the build machine's platform; use `bun build --target=bun-linux-x64`
+  (etc.) in the `build:exe` script to cross-compile.
+
 ## Prerequisites
 
-- **Node.js** (v18+)
+- **Node.js** (v18+; v22.15+ to recover original sources from embedded sourcemaps)
 - **Bun** (optional — only needed to *run* the extracted code, not to decompile it)
 
 ## How it works
@@ -114,12 +141,25 @@ node src/apply-reference-layout.mjs new-decoded/ --reference old-decoded-organiz
 Bun standalone executables embed all JavaScript in a `__BUN` Mach-O section (macOS), appended ELF data (Linux), or `.bun` PE section (Windows). The section contains a `StandaloneModuleGraph`:
 
 ```
-[8-byte size header (u64 LE)]
+[8-byte size header (u64 LE)]           (Mach-O and PE sections)
 [data buffer: source code, bytecode, native addons, wasm modules...]
-[module table: array of CompiledModuleGraphFile structs (52 bytes each)]
-[Offsets struct (32 bytes)]
+[module table: array of CompiledModuleGraphFile structs (52 bytes each, 36 in older Bun)]
+[Offsets struct (32 bytes)]             byte_count = size of data buffer only
 [\n---- Bun! ----\n]
 ```
+
+Module names live under a virtual root: `/$bunfs/root/` on macOS/Linux, `B:/~BUN/root/` on Windows.
+On Windows the entry bundle is named after the executable (`app.exe` → extracted as `app.js`).
+
+`extract.mjs` also reports the Bun runtime version statically, from the banner compiled into
+every Bun build (`Bun v1.3.14 (0d9b296a) Windows x64`), and stores it as `bunVersion` in
+`extracted/manifest.json`. On Windows the PE version resource usually holds it too, but it can be
+overridden at compile time (`--windows-version`).
+
+Embedded sourcemaps (`--sourcemap`) use Bun's binary format: a file count, the original file
+names and their **zstd-compressed original sources**. `extract.mjs` decodes them into
+`extracted/_sources/` (requires Node ≥ 22.15 for `zlib.zstdDecompressSync`) and keeps the raw blob
+as `<file>.bunmap`. Bytecode (`--bytecode`) is written as `<file>.jsc`.
 
 Even with `--bytecode` compilation, the full JavaScript source is always stored alongside the bytecode (JSC requires it). The `--bytecode` flag is a startup optimization, not obfuscation.
 
@@ -151,7 +191,7 @@ Runtime files (`00-runtime.js`, `99-main.js`) are automatically excluded from wa
 
 ### Name recovery
 
-Bun's `__export()` pattern — `MR(target, { exportName: () => minifiedVar })` — preserves original export names as string keys. This is the single biggest source of name recovery. Additional patterns: `this.name = "X"` in class constructors, `displayName = "X"` assignments, and 20+ mapped Bun runtime helpers.
+Bun's `__export()` pattern — `MR(target, { exportName: () => minifiedVar })` — preserves original export names as string keys. The helper is renamed in every build (`MR`, `u`, `gR`…), so it is detected by structure (`src/bun-runtime.mjs`), recorded as `_meta.exportHelper` in the resplit manifest, and can be forced with `extract-exports.mjs --export-fn <name>`. This is the single biggest source of name recovery. Additional patterns: `this.name = "X"` in class constructors, `displayName = "X"` assignments, and 20+ mapped Bun runtime helpers.
 
 For remaining identifiers, AI-assisted renaming (`ai-rename.mjs`, `ai-rename-scoped.mjs`) uses LLMs to infer semantic names from context.
 
@@ -225,13 +265,16 @@ After deobfuscation, modules are flat numbered files. The organization pipeline 
 
 - **macOS**: `__BUN`/`__bun` Mach-O segment. Code signature after trailer (~1.7MB padding).
 - **Linux**: Data appended to ELF binary. Trailer at very end.
-- **Windows**: `.bun` PE section. No 8-byte size header.
+- **Windows**: `.bun` PE section (8-byte size header, like Mach-O). Virtual root `B:/~BUN/root/`.
+  All scripts run natively on Windows; `diff-versions.mjs` falls back to `git diff --no-index`
+  when `diff` is not installed.
 - Native `.node` addons are platform-specific. JS and WASM are portable.
 
 ## Project structure
 
 ```
-src/                    18 pipeline scripts (all standalone, no cross-imports)
+src/                    pipeline scripts (standalone, sharing path-guard.mjs, bun-runtime.mjs, subcommand.mjs)
+  cli.mjs               single entry point / subcommand dispatcher (used by the executable)
 data/
   vendor-fingerprints-1000.json   Vendor fingerprint DB (26MB, 1,668 packages)
 docs/

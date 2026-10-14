@@ -29,8 +29,9 @@
 
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
+import { scriptCommand } from "./subcommand.mjs";
 
 /** Find the largest .js file in a directory (the main bundle) */
 function findLargestBundle(dir) {
@@ -170,7 +171,9 @@ function parseArgs() {
 function resolveVersionDir(name) {
   if (path.isAbsolute(name) && fs.existsSync(name)) return name;
   const ver = name.replace(/^v/, "");
-  const dirs = fs.readdirSync(VERSIONS_DIR).filter(d => d.includes("_v")).sort();
+  const dirs = fs.existsSync(VERSIONS_DIR)
+    ? fs.readdirSync(VERSIONS_DIR).filter(d => d.includes("_v")).sort()
+    : [];
   const match = dirs.find(d => d.includes(`_v${ver}`));
   if (match) return path.join(VERSIONS_DIR, match);
   const resolved = path.resolve(name);
@@ -257,8 +260,8 @@ function ensureResplit(versionDir) {
   }
 
   console.error(`Resplitting ${path.basename(versionDir)}...`);
-  const resplitScript = path.join(__dirname, "resplit.mjs");
-  execSync(`node ${resplitScript} "${bundlePath}" "${resplitDir}"`, {
+  const [cmd, cmdArgs] = scriptCommand(__dirname, "resplit");
+  execFileSync(cmd, [...cmdArgs, bundlePath, resplitDir], {
     stdio: ["pipe", "pipe", "inherit"],
   });
   console.error(`  Done.`);
@@ -953,13 +956,14 @@ async function main() {
   let reExtractedCount = 0;
 
   if (!opts.dryRun) {
-    const extractExportsScript = path.join(__dirname, "extract-exports.mjs");
-    const extractNamesScript = path.join(__dirname, "extract-names.mjs");
+    const [exportsCmd, exportsArgs] = scriptCommand(__dirname, "extract-exports");
+    const [namesCmd, namesArgs] = scriptCommand(__dirname, "extract-names");
 
     // Run extract-exports on target resplit
     try {
-      const exportsJson = execSync(
-        `node "${extractExportsScript}" "${resplitTarget}"`,
+      const exportsJson = execFileSync(
+        exportsCmd,
+        [...exportsArgs, resplitTarget],
         { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
       );
       const exports = JSON.parse(exportsJson);
@@ -973,8 +977,9 @@ async function main() {
 
     // Run extract-names on target resplit
     try {
-      const namesJson = execSync(
-        `node "${extractNamesScript}" "${resplitTarget}"`,
+      const namesJson = execFileSync(
+        namesCmd,
+        [...namesArgs, resplitTarget],
         { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
       );
       const names = JSON.parse(namesJson);

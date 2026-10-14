@@ -1,6 +1,12 @@
 {
   "name": "bun-demincer",
   "type": "module",
+  "bin": {
+    "bun-demincer": "src/cli.mjs"
+  },
+  "scripts": {
+    "build:exe": "bun build src/cli.mjs --compile --external canvas --outfile dist/bun-demincer"
+  },
   "dependencies": {
     "@babel/generator": "^7.26.0",
     "@babel/parser": "^7.26.0",
