@@ -20,6 +20,32 @@ Bun binary (opaque executable)
 
 The deobfuscated code is not just readable — it's **runnable**. You can modify individual module files and reassemble them back into a working Bun binary.
 
+**New to the tool?** Read the [user guide](docs/GUIDE.md): what each step produces, how to read
+the extraction output, and which steps a given binary actually needs.
+
+## What's new in this fork
+
+Changes on top of [vicnaum/bun-demincer](https://github.com/vicnaum/bun-demincer):
+
+- **Windows executables**: `extract` parses the PE `.bun` section and the `B:/~BUN/root/`
+  virtual paths; all scripts run natively on Windows (path handling, `git diff` fallback when
+  `diff` is missing).
+- **Original sources recovery**: when a binary embeds sourcemaps, `extract` decodes them
+  (zstd) into `extracted/_sources/`, i.e. the original pre-bundle tree.
+- **More robust extraction**: correct data offset computation on every platform, older 36-byte
+  module tables, Latin-1 bundles re-encoded to UTF-8, bytecode dumped as `.jsc`, entry bundle
+  given a `.js` name.
+- **Bun version detection**: reported statically (no execution) and stored in the manifest.
+- **Export helper detection**: Bun's `__export` helper is recognized by structure instead of the
+  hardcoded name `MR`, so export-based renaming works on any build.
+- **Security hardening** for hostile binaries: no path traversal from embedded module names,
+  rename targets restricted to valid identifiers (no code injection through bundle strings), no
+  shell string interpolation, guarded deletion in `organize`.
+- **Single executable**: `npm run build:exe` builds `bun-demincer(.exe)` with all commands
+  (`bun-demincer extract|resplit|deobfuscate|...`), no Node.js or npm needed to run it.
+- **Agent skill**: [.claude/skills/bun-demincer](.claude/skills/bun-demincer/SKILL.md) lets coding
+  agents drive the executable safely.
+
 ## Quick start
 
 ```bash
@@ -73,14 +99,14 @@ Steps 1-4 are fully automated. Steps 5-8 organize the output into directories �
 After deobfuscating (and optionally modifying) individual module files, reassemble them back into a working binary:
 
 ```bash
-# Reassemble deobfuscated modules into a runnable bundle
-node scripts/build.mjs <version-dir> --source decoded --no-bun-cjs
+# Reassemble deobfuscated modules into a runnable bundle (original module order)
+node src/resplit.mjs --reassemble decoded/ reassembled.js
 
-# Run it
-cd <version-dir>/extracted && bun run.js --version
+# Run it (only if you trust the original binary)
+bun reassembled.js --version
 ```
 
-The `--no-bun-cjs` flag wraps the code as a self-executing IIFE instead of relying on Bun's strict `@bun-cjs` CJS loader, which requires byte-exact formatting incompatible with any code transformation.
+The upstream `build.mjs` script (IIFE wrapping with `--no-bun-cjs`) is not part of this repository.
 
 ### With AI-assisted renaming (optional, improves readability)
 
@@ -231,14 +257,15 @@ After deobfuscation, modules are flat numbered files. The organization pipeline 
 | `src/resplit.mjs` | Split bundle into 1-module-per-file |
 | `src/match-vendors.mjs` | Vendor classification: fingerprint DB + flood-fill. `--classify`, `--no-move` |
 | `src/deobfuscate.mjs` | Full pipeline: wakaru → lebab → extract → rename → prettier |
-| `build.mjs` (in project) | Reassemble modules into runnable bundle. `--no-bun-cjs`, `--run` |
+| `src/resplit.mjs --reassemble` | Reassemble module files into one runnable bundle |
+| `src/cli.mjs` | Single entry point: `cli.mjs <command> [args]`, compiled by `npm run build:exe` |
 
 ### Name Recovery
 
 | Script | Description |
 |--------|-------------|
 | `src/rename.mjs` | Format-preserving AST rename (recast). Single, batch JSON, `--dry-run` |
-| `src/extract-exports.mjs` | Auto-extract `MR()` export mappings → rename JSON |
+| `src/extract-exports.mjs` | Auto-extract `__export()` mappings (helper auto-detected) → rename JSON |
 | `src/extract-names.mjs` | Extract renames from `this.name="X"` + `displayName="X"` patterns |
 | `src/extract-tools.mjs` | Extract names from `userFacingName()` patterns |
 | `src/extract-errors.mjs` | Extract error class names from factory patterns |
@@ -278,6 +305,7 @@ src/                    pipeline scripts (standalone, sharing path-guard.mjs, bu
 data/
   vendor-fingerprints-1000.json   Vendor fingerprint DB (26MB, 1,668 packages)
 docs/
+  GUIDE.md              User guide: outputs of each step, how to read them, what to do next
   BUN.md                Bun bundler internals & deobfuscation strategies
 ```
 
